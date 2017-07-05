@@ -128,3 +128,6 @@ $ dig +short a @127.0.0.53 master.k8s
 192.168.2.1
 192.168.2.2
 ```
+
+## Credits
+This implementation is an enhanced version of http://mkaczanowski.com/golang-build-dynamic-dns-service-go/
