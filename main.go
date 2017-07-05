@@ -1,12 +1,8 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
-	"errors"
 	"flag"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,117 +10,23 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/miekg/dns"
+	"github.com/s-urbaniak/dyndns/records"
 )
 
 var (
-	tsig     *string
-	db_path  *string
-	port     *int
-	bdb      *bolt.DB
-	logfile  *string
-	pid_file *string
+	tsig    *string
+	db_path *string
+	port    *int
+	repo    records.Records
+	logfile *string
 )
-
-var rr_bucket = []byte{'r', 'r'}
-
-func newKey(domain string, rtype uint16) (string, error) {
-	if n, ok := dns.IsDomainName(domain); ok {
-		labels := dns.SplitDomainName(domain)
-
-		// Reverse domain, starting from top-level domain
-		for i := 0; i < n/2; i++ {
-			j := n - i - 1
-			labels[i], labels[j] = labels[j], labels[i]
-		}
-
-		reverse_domain := strings.Join(labels, ".")
-		return strings.Join([]string{reverse_domain, strconv.Itoa(int(rtype))}, "_"), nil
-	}
-
-	return "", errors.New("Invalid domain: " + domain)
-}
-
-func createBucket(bucket []byte) (err error) {
-	err = bdb.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(bucket)
-		return err
-	})
-
-	return err
-}
-
-func remove(domain string, rtype uint16) (err error) {
-	key, _ := newKey(domain, rtype)
-	err = bdb.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(rr_bucket)
-		return b.Delete([]byte(key))
-	})
-
-	return err
-}
-
-func store(domain string, rtype uint16, rrs []dns.RR) (err error) {
-	key, _ := newKey(domain, rtype)
-
-	err = bdb.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(rr_bucket)
-		var buf bytes.Buffer
-		vs := make([]string, len(rrs))
-
-		for i, _ := range rrs {
-			vs[i] = rrs[i].String()
-		}
-
-		gob.NewEncoder(&buf).Encode(vs)
-		return b.Put([]byte(key), buf.Bytes())
-	})
-
-	return err
-}
-
-func get(domain string, rtype uint16) ([]dns.RR, error) {
-	key, _ := newKey(domain, rtype)
-	var vs []string
-
-	err := bdb.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(rr_bucket)
-		vb := b.Get([]byte(key))
-
-		if len(vb) == 0 {
-			return errors.New("Record not found, key: " + key)
-		}
-
-		buf := bytes.NewBuffer(vb)
-		gob.NewDecoder(buf).Decode(&vs)
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	rrs := make([]dns.RR, len(vs))
-	for i, _ := range vs {
-		rr, err := dns.NewRR(vs[i])
-		if err != nil {
-			return nil, err
-		}
-		rrs[i] = rr
-	}
-
-	return rrs, nil
-}
 
 func update(r dns.RR, q *dns.Question) {
 	var (
-		rrs   []dns.RR
 		name  string
 		rtype uint16
 		ttl   uint32
-		ip    net.IP
 	)
 
 	header := r.Header()
@@ -138,7 +40,7 @@ func update(r dns.RR, q *dns.Question) {
 	}
 
 	if header.Class == dns.ClassANY && header.Rdlength == 0 {
-		remove(name, rtype)
+		_ = repo.Delete(name, rtype)
 		return
 	}
 
@@ -151,37 +53,21 @@ func update(r dns.RR, q *dns.Question) {
 
 	switch a := r.(type) {
 	case *dns.A:
-		rrs, _ = get(name, rtype)
-		if rrs == nil {
-			rrs = []dns.RR{}
-		}
-
-		ip = a.A
-		rr := &dns.A{
+		_ = repo.Append(&dns.A{
 			Hdr: rheader,
-			A:   ip,
-		}
-		rrs = append(rrs, rr)
+			A:   a.A,
+		})
 
 	case *dns.AAAA:
-		rrs, _ = get(name, rtype)
-		if rrs == nil {
-			rrs = []dns.RR{}
-		}
-
-		ip = a.AAAA
-		rr := &dns.AAAA{
-			Hdr:  rheader,
-			AAAA: ip,
-		}
-		rrs = append(rrs, rr)
+		_ = repo.Append(&dns.A{
+			Hdr: rheader,
+			A:   a.AAAA,
+		})
 
 	default:
 		// unsupported record type, skip
 		return
 	}
-
-	store(name, rtype, rrs)
 }
 
 func query(m *dns.Msg) {
@@ -189,7 +75,7 @@ func query(m *dns.Msg) {
 	var err error
 
 	for _, q := range m.Question {
-		if rrs, err = get(q.Name, q.Qtype); err != nil {
+		if rrs, err = repo.Get(q.Name, q.Qtype); err != nil {
 			// skip faulty records
 			continue
 		}
@@ -267,22 +153,16 @@ func main() {
 	port = flag.Int("port", 53, "server port")
 	tsig = flag.String("tsig", " ", "use MD5 hmac tsig: keyname:base64")
 	db_path = flag.String("db_path", "./dyndns.db", "location where db will be stored")
-	pid_file = flag.String("pid", "./go-dyndns.pid", "pid file location")
 
 	flag.Parse()
 
 	// Open db
-	db, err := bolt.Open(*db_path, 0600,
-		&bolt.Options{Timeout: 10 * time.Second})
-
+	var err error
+	repo, err = records.OpenBolt(*db_path)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
-	bdb = db
-
-	// Create dns bucket if doesn't exist
-	createBucket(rr_bucket)
+	defer repo.Close()
 
 	// Attach request handler func
 	dns.HandleFunc(".", handleDnsRequest)
