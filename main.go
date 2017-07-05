@@ -59,9 +59,9 @@ func update(r dns.RR, q *dns.Question) {
 		})
 
 	case *dns.AAAA:
-		_ = repo.Append(&dns.A{
-			Hdr: rheader,
-			A:   a.AAAA,
+		_ = repo.Append(&dns.AAAA{
+			Hdr:  rheader,
+			AAAA: a.AAAA,
 		})
 
 	default:
