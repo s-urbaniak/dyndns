@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/s-urbaniak/dyndns/decorator"
 	"github.com/s-urbaniak/dyndns/records"
 )
 
@@ -100,7 +101,6 @@ func handleDnsRequest(w dns.ResponseWriter, r *dns.Msg) {
 	case dns.OpcodeUpdate:
 		for _, question := range r.Question {
 			for _, rr := range r.Ns {
-				log.Println("updating rr", rr)
 				update(rr, &question)
 			}
 		}
@@ -153,8 +153,9 @@ func main() {
 	port = flag.Int("port", 53, "server port")
 	tsig = flag.String("tsig", " ", "use MD5 hmac tsig: keyname:base64")
 	db_path = flag.String("db_path", "./dyndns.db", "location where db will be stored")
-
 	flag.Parse()
+
+	log := log.New(os.Stderr, "", log.LstdFlags)
 
 	// Open db
 	var err error
@@ -164,8 +165,10 @@ func main() {
 	}
 	defer repo.Close()
 
+	d := decorator.Log(log, dns.OpcodeUpdate)
+
 	// Attach request handler func
-	dns.HandleFunc(".", handleDnsRequest)
+	dns.Handle(".", d.Wrap(dns.HandlerFunc(handleDnsRequest)))
 
 	// Tsig extract
 	if *tsig != " " {
@@ -174,6 +177,7 @@ func main() {
 	}
 
 	// Start server
+	log.Println("starting server")
 	go serve(name, secret, *port)
 
 	sig := make(chan os.Signal)
